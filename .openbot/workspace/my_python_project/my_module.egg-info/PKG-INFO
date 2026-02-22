@@ -1,0 +1,36 @@
+Metadata-Version: 2.4
+Name: my-module
+Version: 0.1.0
+Summary: A simple calculator module
+Author-email: User <user@example.com>
+Project-URL: Homepage, https://github.com/user/my-module
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+
+# Python Project
+
+A simple Python project for demonstration.
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+## Usage
+
+```python
+from my_module import calculator
+
+result = calculator.add(2, 3)
+print(result)  # Output: 5
+```
+
+## Testing
+
+```bash
+pytest
+```

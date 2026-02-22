@@ -1,0 +1,2 @@
+[console_scripts]
+openbot = openbot.cli.commands:app

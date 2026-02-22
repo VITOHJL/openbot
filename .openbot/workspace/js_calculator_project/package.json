@@ -1,0 +1,15 @@
+{
+  "name": "js-calculator",
+  "version": "1.0.0",
+  "description": "A simple calculator module in JavaScript",
+  "main": "calculator.js",
+  "scripts": {
+    "test": "jest"
+  },
+  "keywords": ["calculator", "math"],
+  "author": "User",
+  "license": "MIT",
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}

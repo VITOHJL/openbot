@@ -1,0 +1,36 @@
+Metadata-Version: 2.4
+Name: openbot
+Version: 0.1.0
+Summary: A single-agent, auditable AI assistant with workflows and tooling.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: typer>=0.9.0
+Requires-Dist: litellm>=1.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pydantic-settings>=2.0.0
+Requires-Dist: loguru>=0.7.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: qq-botpy>=1.0.0
+Requires-Dist: playwright>=1.40.0
+Requires-Dist: playwright-stealth>=1.0.6
+Requires-Dist: httpx>=0.25.0
+Requires-Dist: readability-lxml>=0.8.0
+Requires-Dist: mcp>=1.0.0
+Requires-Dist: json-repair>=0.30.0
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+
+# openbot
+
+一个基于 **单 Agent 规范** 的 AI 助手，具备：
+
+- 单执行 Agent：所有工具调用都经由一个核心循环
+- 三层能力栈：Atomic / Skill / Workflow
+- 瘦执行上下文 + 完整 ExecutionTrace 日志
+- 编排 Agent：任务拆解、模板抽取、测试用例生成
+- 日志监督 Agent：行为审计、防止“为达目的而撒谎”
+- QQ + CLI 渠道：最小但可用的外接通讯能力
+
+详细设计规范见仓库根目录的 `SPEC.md`。该项目的目标是在实践中验证并迭代这套规范。
+

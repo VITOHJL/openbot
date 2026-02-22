@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+my_module/__init__.py
+my_module/calculator.py
+my_module.egg-info/PKG-INFO
+my_module.egg-info/SOURCES.txt
+my_module.egg-info/dependency_links.txt
+my_module.egg-info/top_level.txt
+tests/test_calculator.py
