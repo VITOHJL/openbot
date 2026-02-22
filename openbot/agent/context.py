@@ -38,6 +38,7 @@ class ContextBuilder:
         session: Session,
         execution_context: dict[str, Any],
         capability_list: list[dict[str, Any]],
+        include_session_context: bool = True,
     ) -> str:
         """构建系统提示（两层上下文）。
         
@@ -45,6 +46,7 @@ class ContextBuilder:
             session: 会话对象
             execution_context: 执行上下文（瘦上下文，4类信息）
             capability_list: 能力清单
+            include_session_context: 是否包含 Session 上下文（用于理解任务）
         
         Returns:
             完整的系统提示
@@ -54,9 +56,10 @@ class ContextBuilder:
         # 1. 身份和约束（固定）
         parts.append(self._get_identity())
         
-        # 2. Session 上下文（用于理解任务）
-        session_context = self.session_manager.get_context_for_task_understanding(session)
-        parts.append(self._format_session_context(session_context))
+        # 2. Session 上下文（可选，用于理解任务）
+        if include_session_context:
+            session_context = self.session_manager.get_context_for_task_understanding(session)
+            parts.append(self._format_session_context(session_context))
         
         # 3. 执行上下文（瘦上下文，用于执行任务）
         parts.append(self._format_execution_context(execution_context))
@@ -73,6 +76,8 @@ class ContextBuilder:
         current_message: str,
         capability_list: list[dict[str, Any]],
         media: list[str] | None = None,
+        include_session_context: bool = True,
+        include_session_history: bool = True,
     ) -> list[dict[str, Any]]:
         """构建完整的消息列表。
         
@@ -82,6 +87,8 @@ class ContextBuilder:
             current_message: 当前用户消息
             capability_list: 能力清单
             media: 可选媒体文件列表
+            include_session_context: 是否包含 Session 上下文（用于理解任务）
+            include_session_history: 是否包含 Session 历史（用于理解任务）
         
         Returns:
             消息列表（包含 system prompt + history + current message）
@@ -89,12 +96,18 @@ class ContextBuilder:
         messages = []
         
         # System prompt
-        system_prompt = self.build_system_prompt(session, execution_context, capability_list)
+        system_prompt = self.build_system_prompt(
+            session, 
+            execution_context, 
+            capability_list,
+            include_session_context=include_session_context,
+        )
         messages.append({"role": "system", "content": system_prompt})
         
-        # Session 历史（用于理解任务，但也要控制长度）
-        session_history = session.get_history(max_messages=self.session_window)
-        messages.extend(session_history)
+        # Session 历史（可选，用于理解任务）
+        if include_session_history:
+            session_history = session.get_history(max_messages=self.session_window)
+            messages.extend(session_history)
         
         # 当前消息（支持媒体）
         user_content = self._build_user_content(current_message, media)
@@ -139,6 +152,7 @@ Your workspace is at: {workspace_path}
 2. You must be honest about execution results. Do not fabricate success or hide failures.
 3. All your decisions and tool calls are logged for auditing purposes.
 4. When a task is completed successfully, the execution trace may be extracted as a candidate workflow template.
+5. **Current state is authoritative**: When describing workspace/directory structure, file existence, or current state, you MUST call list_dir/read_file etc. to get fresh data. Do NOT rely on information from previous messages—files may have been added, removed, or changed since then. Old conversation history may contain outdated information.
 
 Always be helpful, accurate, and concise. Before calling tools, briefly tell the user what you're about to do."""
 

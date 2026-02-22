@@ -6,10 +6,6 @@ from openbot.infra.database import Database
 from openbot.schemas.test_case_spec import TestCaseSpec
 
 
-class TestResult(dict):
-    """简单的测试结果占位结构。"""
-
-
 class TestCaseStore:
     """测试用例存储，集成 SQLite 数据库持久化。"""
 
@@ -39,11 +35,12 @@ class TestCaseStore:
         self._cases[capability] = cases
         return cases
 
-    def execute(self, test_case: TestCaseSpec) -> TestResult:
-        """占位：真实实现会调用 ExecutionAgent 运行测试。
+    def execute(self, test_case: TestCaseSpec) -> dict[str, Any]:
+        """占位：真实实现会调用 TesterAgent 运行测试。
 
-        这里先返回一个固定结构，方便后续接入。
+        注意：此方法已废弃，请使用 TesterAgent.execute_test_case 代替。
+        这里保留向后兼容。
         """
         _ = test_case
-        return TestResult({"passed": False, "reason": "not implemented"})
+        return {"passed": False, "reason": "not implemented - use TesterAgent instead"}
 

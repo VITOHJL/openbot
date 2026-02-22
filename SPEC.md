@@ -66,79 +66,101 @@ tedbot 是一个**单 Agent 架构**的 AI 助手系统，核心设计理念：
 
 ## 二、Agent 详细设计规范
 
-### 2.1 执行 Agent (Runtime Agent)
+### 2.1 执行 Agent (Execution Agent)
 
 #### 2.1.1 职责
 
 - 唯一在线执行者，负责实际调用工具、记录日志、返回结果
-- 在瘦上下文约束下进行 React 模式决策
+- 接收「单个子任务」并在其范围内以 React 模式完成目标
+- 不负责整体任务拆解与路线设计（由编排 Agent 负责）
 - 所有能力调用必须经过 CapabilityRegistry 验证
 - 所有行为必须记录到 LogService
 
 #### 2.1.2 核心流程
 
-**阶段 1: 任务接收与初始化**
+**阶段 1: 子任务接收与初始化**
 
-1. 接收用户任务请求（文本或结构化 JSON）
-2. 任务规范化解析（确定性代码）
-   - 提取：目标、约束条件、输出格式、上下文键
-3. 初始化瘦上下文（ContextManager）
-   - 写入 4 类信息：
-     - 精简任务信息（目标/约束/格式）
+1. 接收来自编排 Agent 的「子任务指令」：
+   - 主任务描述（只读，用于理解大方向，但不参与重规划）
+   - 当前子任务目标 `subtask_goal`（必须）
+   - 推荐完成方式：
+     - `recommended_capability`
+     - `inputs`（推荐初始参数）
+   - 可选执行策略：
+     - `execution_mode`（如 strict / flexible）
+     - 内部重试/React 策略（由确定性代码控制）
+2. 初始化瘦上下文（ContextManager）：
+   - 写入 4 类信息（均以「当前子任务」为中心）：
+     - 精简任务信息（主任务摘要 + 当前子任务目标）
      - 极简步骤历史（序号/动作/结果摘要，初始为空）
      - 结构化环境状态（JSON/Key-Value，初始为空）
      - 最近 3-5 轮工具 I/O（初始为空）
    - 设置滑动窗口：只保留最近几步，超长历史写入日志
 
-**阶段 2: 执行循环（React 模式）**
+**阶段 2: 子任务内部执行循环（React 模式）**
 
-循环开始前，检查是否存在预先 Plan：
-- 如果存在（来自编排 Agent 模式 A）：
-  - 将 Plan 作为优先参考，但不强制
-  - 若偏离 Plan，需在日志中记录偏离原因
+针对单个子任务，运行局部 React 循环（最多子任务级 `max_iterations` 次）：
 
-主循环（最多 max_iterations 次）：
-
-1. **LLM 规划下一步**
-   - 输入：当前瘦上下文（4 类信息）+ 能力清单 + 可选预先 Plan
-   - LLM 决策点：理解当前任务状态和子目标，建议下一步计划草案
-   - 约束：只能从能力清单中选择，不能编造
+1. **LLM 规划当前子任务的下一步**
+   - 输入：
+     - 当前瘦上下文（4 类信息）
+     - 能力清单（来自 CapabilityRegistry）
+     - 当前子任务目标 `subtask_goal`
+     - 推荐完成方式（可作为提示，但非硬约束）
+   - LLM 决策点：
+     - 理解当前子任务进度
+     - 决定下一步要调用的能力与参数草案
+   - 约束：
+     - 只能从能力清单中选择，不能编造能力
 
 2. **能力解析与验证**
    - 从 CapabilityRegistry 中查找目标能力
    - 确定能力层级（Workflow/Skill/Atomic）
+   - 若能力不存在 → 记录失败，并将错误写入日志
 
 3. **参数构造**
    - 根据能力 schema 和当前上下文构造参数
    - 确定性映射 + 可选 LLM 补全文本字段
-   - 参数校验
+   - 参数校验（结构化 JSON Schema 校验）
 
 4. **执行能力调用**
    - 调用能力（确定性执行）
-   - 执行结果：成功返回结果数据，失败返回错误信息
+   - 执行结果：
+     - 成功：返回结果数据
+     - 失败：返回错误信息
 
 5. **更新上下文与日志**
    - 更新瘦上下文（步骤历史 + 最近工具 I/O + 环境状态）
-   - 写入完整日志（LogService，结构化 JSON）
+   - 写入完整日志到 LogService（结构化 JSON）：
+     - 每一步的 LLM 决策、能力调用、输入输出、耗时等
 
-6. **结果校验**
-   - 确定性校验（返回码、结构校验）
-   - 可选 LLM 评估（结果是否满足当前子目标）
+6. **结果校验（针对当前子任务）**
+   - 确定性校验：
+     - 返回码、结构校验
+     - 与当前子任务的 `success_criteria`（若有）比对
+   - 可选 LLM 评估：
+     - 当前子任务是否已经达到目标
 
-7. **下一步决策**
-   - LLM 决策点：继续/终止/无法完成
-   - 若继续：回到步骤 1
-   - 若终止：进入成功分支
-   - 若无法完成：进入失败分支
+7. **子任务级终止决策**
+   - 若判定当前子任务目标达成：
+     - 结束子任务执行循环，返回成功状态
+   - 若在预算内仍未完成：
+     - 继续回到步骤 1（在子任务范围内 React）
+   - 若明显不可完成 / 超出内部预算：
+     - 结束子任务执行循环，返回失败状态
 
-**阶段 3: 任务结束处理**
+**阶段 3: 整体任务结束处理**
 
-- **成功分支**:
-  - 输出成功结果给用户
-  - 若执行轨迹质量较好，抽取执行轨迹为候选 Workflow 骨架
-- **失败分支**:
-  - LLM 生成失败/局限性说明（不改原始结果）
-  - 输出失败结果 + 解释给用户
+执行 Agent 仅负责将所有子任务执行过程汇总为 ExecutionTrace，并返回最终结果文本：
+
+- **成功分支**：
+  - 返回成功结果给用户
+  - 完整 ExecutionTrace 写入数据库
+- **失败分支**：
+  - 返回失败结果 + 局限性说明给用户
+  - 完整 ExecutionTrace 写入数据库
+
+执行 Agent 不直接参与「工作流提取」或「失败经验构建」，只负责提供高质量轨迹给后续 Agent 使用。
 
 #### 2.1.3 核心约束
 
@@ -173,75 +195,122 @@ tedbot 是一个**单 Agent 架构**的 AI 助手系统，核心设计理念：
 
 ---
 
-### 2.2 编排 Agent (Planner Agent)
+### 2.2 编排 Agent (Planner / Orchestration Agent)
 
 #### 2.2.1 职责
 
 - 任务拆解 Plan 设计（模式 A）
 - 从成功执行日志抽象 Workflow（模式 B）
 - 为能力/Workflow 生成测试用例（模式 C）
+- 基于失败执行轨迹和审计结果构建「失败经验」（模式 D）
 
 #### 2.2.2 模式 A: 任务拆解 Plan 设计
 
-**触发时机**: 用户提交新任务，希望获得执行计划（可选，非必须）
+**触发时机**：用户提交新任务，或上游渠道请求一次完整的执行计划。
 
-**输入**:
+**输入**：
 - 任务描述（规范化后）
 - 能力清单（来自 CapabilityRegistry）
-- 可选：历史成功案例
+- Session 上下文（用于理解任务）
+- 失败经验库摘要（可选，按任务类型筛选相关 FailureExperience，并以提示形式提供）
 
-**处理流程**:
-1. LLM 基于方法论拆解任务
-2. 输出 PlanSpec（JSON）
+**处理流程**：
+1. LLM 基于能力清单与失败经验，拆解任务为一组有依赖的子任务；
+2. 对每个子任务：
+   - 明确 `subtask_goal`（子任务要达到的目标状态）；
+   - 给出推荐完成方式：
+     - `recommended_capability`
+     - 初始 `inputs`
+   - 指定依赖关系、是否可选、执行模式（strict/flexible 等）；
+   - 给出结构化 `success_criteria`；
+3. 输出 PlanSpec（JSON）。
 
-**输出**: `PlanSpec` JSON Schema（见 3.1）
+**输出**：`PlanSpec` JSON Schema（见 3.1），是后续执行 Agent 的「高层执行规范」。
 
-**输出去向**: 可选传递给执行 Agent 作为参考（不强制）
+**输出去向**：
+- 写入 Database（plans 表）以便审计/回放；
+- 按子任务粒度传递给执行 Agent（一次一个子任务）。
 
 #### 2.2.3 模式 B: 从成功执行日志抽象 Workflow
 
-**触发时机**:
-- 执行 Agent 完成任务并生成候选 Workflow 骨架
-- 日志监督 Agent 判定执行轨迹可接受
+**触发时机**：
+- 审计 Agent 完成审计，且：
+  - `verdict == "pass"` 且
+  - `template_candidate_eligible == true`
 
-**输入**:
-- ExecutionTrace（来自 LogService）
-- 审计结果（来自日志监督 Agent）
+**输入**：
+- ExecutionTrace（来自 LogService / Database）
+- AuditReport（来自审计 Agent）
 
-**处理流程**:
-1. 读取 ExecutionTrace
-2. 过滤与抽象（移除临时/探索性步骤）
-3. 精炼为 Workflow 定义
-4. 输出 CandidateWorkflowSpec（JSON）
+**处理流程**：
+1. 读取 ExecutionTrace；
+2. 结合 AuditReport 中的 `workflow_extraction_notes`：
+   - 跳过探索性、失败且已被纠正的步骤；
+   - 跳过与业务无关的杂项操作；
+3. 将剩余步骤按「业务逻辑顺序」抽象为 WorkflowStepSpec 列表；
+4. 输出 CandidateWorkflowSpec（JSON）。
 
-**输出**: `CandidateWorkflowSpec` JSON Schema（见 3.3）
+**输出**：`CandidateWorkflowSpec` JSON Schema（见 3.3）。
 
-**输出去向**: 提交人工审核，审核通过后写入 TemplateRegistry
+**输出去向**：
+- 写入 TemplateRegistry 作为「候选工作流」；
+- 提交测试 Agent 生成测试用例；
+- 最终进入「待人工审批区」，人工批准后正式注册为 Workflow 能力。
 
 #### 2.2.4 模式 C: 为能力/Workflow 生成测试用例
 
-**触发时机**:
-- 新能力/Workflow 注册后
-- 定期回归测试，需要补充用例
+**触发时机**：
+- 新工作流候选（CandidateWorkflowSpec）产出后；
+- 新 Skill / 原子能力上线前或版本变更时；
+- 定期回归测试，需要补充用例。
 
-**输入**:
-- 能力定义（CapabilitySchema）或 Workflow 定义（WorkflowSpec）
-- 可选：现有测试用例
+**输入**：
+- 能力定义（CapabilitySchema）或 Workflow 定义（WorkflowSpec/CandidateWorkflowSpec）；
+- 可选：历史 ExecutionTrace / AuditReport（可用于反向挖掘重要场景）。
 
-**处理流程**:
-1. LLM 设计测试用例矩阵（正常/边界/异常/极端）
-2. 输出 TestCaseSpec 列表（JSON）
+**处理流程**：
+1. LLM 设计测试用例矩阵（正常 / 边界 / 异常 / 极端）；
+2. 输出 TestCaseSpec 列表（JSON）；
+3. 测试 Agent 可以基于这些用例执行实际调用，并汇总结果。
 
-**输出**: `TestCaseSpec` JSON Schema（见 3.5）
+**输出**：`TestCaseSpec` JSON Schema（见 3.5）。
 
-**输出去向**: 写入 TestCaseStore，用于后续回归测试
+**输出去向**：
+- 写入 TestCaseStore，用于后续回归测试；
+- 测试结果 + 置信度评估一并进入「待人工审批区」。
 
-#### 2.2.5 实现文件
+#### 2.2.5 模式 D: 失败经验构建
+
+**触发时机**：
+- 审计 Agent 完成审计，且：
+  - `verdict == "fail"` 或
+  - `risk_level == "high"` 或
+  - 虽 `pass` 但存在值得记录的 `intermediate_error` 等问题。
+
+**输入**：
+- ExecutionTrace；
+- AuditReport。
+
+**处理流程**：
+1. 从审计报告中提取关键问题：
+   - 工具缺失？环境不透明？Plan 假设错误？模型理解错误？；
+2. 从执行轨迹中抽取相关片段（问题发生前后步骤、关键 I/O）；
+3. 将本次失败/问题总结为结构化 FailureExperience 记录；
+4. 保存到经验库（可基于 SQLite 表或文件）。
+
+**输出**：`FailureExperience` JSON（见 3.6）。
+
+**输出去向**：
+- 后续 Planner Mode A 在拆解类似任务时，作为「负面样本」提示；
+- 供人工复盘使用。
+
+#### 2.2.6 实现文件
 
 - `tedbot/agent/planner.py` - 编排 Agent 主实现
 - `tedbot/agent/planner/mode_a_task_plan.py` - 模式 A 实现
 - `tedbot/agent/planner/mode_b_template_extract.py` - 模式 B 实现
 - `tedbot/agent/planner/mode_c_test_generation.py` - 模式 C 实现
+- `tedbot/agent/planner/mode_d_failure_experience.py` - 模式 D 实现
 
 ---
 
@@ -304,22 +373,52 @@ tedbot 是一个**单 Agent 架构**的 AI 助手系统，核心设计理念：
 
 ### 3.1 PlanSpec（编排 Agent 模式 A 输出）
 
+PlanSpec 是「任务执行规范」，由编排 Agent 负责产生，执行 Agent 只负责按其中的子任务目标执行。
+
 ```json
 {
   "plan_id": "plan_xxx",
   "task": "任务描述",
   "created_at": "2024-01-01T00:00:00Z",
+  "execution_mode": "strict | flexible",
+  "max_deviations": 0,
+  "deviation_log_required": true,
   "steps": [
     {
       "step_id": 1,
-      "capability": "workflow_name",
-      "capability_level": "workflow|skill|atomic",
+      "subtask_goal": "说明这一步要达到的目标状态",
+      "recommended_capability": "workflow_or_skill_or_atomic_name",
+      "capability_level": "workflow | skill | atomic",
+      "recommended_method": {
+        "description": "可选：推荐的完成方式说明",
+        "notes": "可选：注意事项"
+      },
       "inputs": {
         "param1": "value1"
       },
-      "success_criteria": "描述成功标准",
+      "success_criteria": {
+        "status": "success | partial | any",
+        "required_fields": ["field1", "field2"],
+        "field_checks": {
+          "field1": {
+            "type": "string",
+            "pattern": "^[a-z]+$"
+          }
+        },
+        "custom_validator": "可选：自定义校验逻辑描述或代码字符串"
+      },
       "dependencies": [],
-      "optional": false
+      "optional": false,
+      "execution_mode": "strict | flexible",
+      "retry_policy": {
+        "max_retries": 3,
+        "backoff_strategy": "exponential",
+        "initial_delay_ms": 1000,
+        "max_delay_ms": 60000
+      },
+      "timeout_seconds": 60,
+      "deviation_allowed": false,
+      "deviation_reason_required": true
     }
   ]
 }
@@ -393,23 +492,30 @@ tedbot 是一个**单 Agent 架构**的 AI 助手系统，核心设计理念：
   "audit_id": "audit_xxx",
   "execution_trace_id": "exec_xxx",
   "audited_at": "2024-01-01T00:06:00Z",
-  "verdict": "pass|fail|warning",
-  "risk_level": "low|medium|high",
+  "verdict": "pass | fail | warning",
+  "risk_level": "low | medium | high",
   "issues": [
     {
-      "type": "lie|unauthorized|incomplete_log",
+      "type": "lie | unauthorized | incomplete_log | intermediate_error",
       "description": "问题描述",
       "evidence": {
         "step_id": 3,
         "log_key": "step_3_output",
         "user_statement": "用户看到的回复",
-        "actual_result": "实际工具结果"
+        "actual_result": "实际工具结果",
+        "corrected_by_step": 7
       }
     }
   ],
-  "template_candidate_eligible": true|false
+  "template_candidate_eligible": true,
+  "workflow_extraction_notes": "可选：对工作流抽取/失败经验构建的建议"
 }
 ```
+
+**说明**：
+- `intermediate_error`：表示中间步骤有错误，但已经被后续步骤修正；
+- 这种错误不会阻止整体 `verdict` 为 `pass`，但会进入 issues，并影响经验构建；
+- `workflow_extraction_notes`：用于指导 Planner Mode B / Mode D 过滤或突出哪些步骤。
 
 **Schema 定义**: `tedbot/schemas/audit_report.py`
 
@@ -431,6 +537,32 @@ tedbot 是一个**单 Agent 架构**的 AI 助手系统，核心设计理念：
 ```
 
 **Schema 定义**: `tedbot/schemas/test_case_spec.py`
+
+### 3.6 FailureExperience（失败经验记录，编排 Agent 模式 D 输出）
+
+FailureExperience 用于结构化记录一次任务执行中「值得学习的失败或问题」，为后续模式 A 提供负面样本参考。
+
+```json
+{
+  "failure_id": "fail_xxx",
+  "task": "原始任务描述",
+  "plan_id": "plan_xxx",
+  "trace_id": "exec_xxx",
+  "failure_stage": "planning | execution | audit",
+  "failure_step_id": 3,
+  "failure_type": "tool_missing | env_opaque | plan_assumption_wrong | model_understanding_error | unknown",
+  "summary": "简短人类可读摘要",
+  "root_cause_hypothesis": "可能的根因分析（来自 Planner/审计）",
+  "context_snippets": [
+    "关键日志片段1",
+    "关键日志片段2"
+  ],
+  "lessons_learned": "给未来 Planner 的建议",
+  "created_at": "2024-01-01T00:07:00Z"
+}
+```
+
+**Schema 定义**：可新增 `tedbot/schemas/failure_experience.py`（或集成到经验模块），供 Planner Mode A 聚合查询。
 
 ---
 
@@ -873,38 +1005,38 @@ class LLMProvider(ABC):
 **任务清单**:
 
 1. **数据结构与 Schema 定义**
-   - [ ] 实现 `PlanSpec` Schema
-   - [ ] 实现 `ExecutionTrace` Schema
-   - [ ] 实现 `CandidateWorkflowSpec` Schema
-   - [ ] 实现 `AuditReport` Schema
-   - [ ] 实现 `TestCaseSpec` Schema
+   - [x] 实现 `PlanSpec` Schema（✅ 已升级：包含 subtask_goal, success_criteria, retry_policy, execution_mode 等）
+   - [x] 实现 `ExecutionTrace` Schema
+   - [x] 实现 `CandidateWorkflowSpec` Schema
+   - [x] 实现 `AuditReport` Schema
+   - [x] 实现 `TestCaseSpec` Schema
 
 2. **ContextManager 实现**
-   - [ ] 实现瘦上下文管理（4 类信息）
-   - [ ] 实现滑动窗口机制
-   - [ ] 实现超长历史归档
+   - [x] 实现瘦上下文管理（4 类信息）
+   - [ ] 实现滑动窗口机制（按新规格强化）
+   - [ ] 实现超长历史归档（与日志系统联动）
 
 3. **LogService 实现**
-   - [ ] 实现结构化日志记录
-   - [ ] 实现日志查询接口
-   - [ ] 实现日志存储（SQLite，见 7.3 节）
+   - [x] 实现结构化日志记录
+   - [x] 实现日志查询接口
+   - [x] 实现日志存储（SQLite，见 7.3 节）
 
 4. **Database 实现（SQLite 持久化）**
-   - [ ] 实现 Database 类（见 7.3.3 节）
-   - [ ] 实现表结构初始化与迁移
-   - [ ] LogService 集成 Database（ExecutionTrace 持久化）
-   - [ ] TemplateRegistry 集成 Database（WorkflowSpec 持久化）
-   - [ ] TestCaseStore 集成 Database（TestCaseSpec 持久化）
+   - [x] 实现 Database 类（见 7.3.3 节）
+   - [x] 实现表结构初始化与迁移
+   - [x] LogService 集成 Database（ExecutionTrace 持久化）
+   - [x] TemplateRegistry 集成 Database（WorkflowSpec 持久化）
+   - [x] TestCaseStore 集成 Database（TestCaseSpec 持久化）
 
 5. **CapabilityRegistry 实现**
-   - [ ] 实现能力注册机制
-   - [ ] 实现能力查询接口
-   - [ ] 实现能力清单生成（供 LLM 使用）
+   - [x] 实现能力注册机制
+   - [x] 实现能力查询接口
+   - [x] 实现能力清单生成（供 LLM 使用）
 
 6. **TemplateRegistry 实现**
-   - [ ] 实现模板存储
-   - [ ] 实现模板匹配接口
-   - [ ] 实现模板版本管理
+   - [x] 实现模板存储
+   - [x] 实现模板匹配接口
+   - [ ] 实现模板版本管理（版本号/变更历史等）
 
 **验收标准**:
 - 所有 Schema 定义完成并通过验证
@@ -918,36 +1050,47 @@ class LLMProvider(ABC):
 
 ### 6.2 Phase 2: 执行 Agent 实现（3-4 周）
 
-**目标**: 实现执行 Agent 核心功能，支持单循环 React 执行
+**目标**: 实现执行 Agent 核心功能，支持「按子任务目标」的局部 React 执行，并完整记录 ExecutionTrace
 
 **任务清单**:
 
-1. **瘦上下文集成**
-   - [ ] 在 `agent/loop.py` 中集成 ContextManager
-   - [ ] 实现任务规范化解析
-   - [ ] 实现瘦上下文初始化
+1. **瘦上下文集成（✅ 已集成）**
+   - [x] 在 `agent/loop.py` 中集成 ContextManager（已实现子任务级上下文管理）
+   - [x] 实现任务规范化解析（抽取目标/约束/输出格式）
+   - [x] 实现瘦上下文初始化（`execution_context` 的基础结构）
+   - [x] 实现命令处理（在任务规范化之前处理 /new, /help 等命令）
 
-2. **执行循环改造**
-   - [ ] 改造现有 `_run_agent_loop` 为新的执行循环
-   - [ ] 实现能力解析与验证
-   - [ ] 实现参数构造（确定性 + LLM 补全）
-   - [ ] 实现能力调用（支持 Workflow/Skill/Atomic）
-   - [ ] 实现上下文更新（滑动窗口）
-   - [ ] 实现日志记录（结构化 JSON）
+2. **执行循环改造（✅ 已重构为 Plan 驱动）**
+   - [x] 改造现有执行循环为 Plan 驱动执行（`_execute_plan` + `_execute_subtask` + `_run_subtask_react_loop`）
+   - [x] 实现能力解析与验证（通过 CapabilityRegistry）
+   - [x] 实现参数构造（支持 `PlanSpec.steps[].inputs` 和 `inputs_schema` 校验）
+   - [x] 实现能力调用（支持 Workflow / Skill / Atomic，通过 CapabilityRegistry）
+   - [x] 实现上下文更新（子任务级上下文管理）
+   - [x] 实现日志记录（结构化 JSON，写入 LogService/Database）
 
 3. **能力栈集成**
-   - [ ] 将现有工具注册到 CapabilityRegistry（Atomic 层）
-   - [ ] 实现 Skill 层能力注册
-   - [ ] 实现 Workflow 层能力注册
-   - [ ] 实现能力清单生成（供 LLM 使用）
+   - [x] 将现有工具注册到 CapabilityRegistry（Atomic 层）
+   - [ ] 梳理并注册稳定的 Skill 层能力集合
+   - [x] 支持 Workflow 层能力注册（从 TemplateRegistry 加载）
+   - [x] 实现能力清单生成（供 LLM 使用）
 
-4. **Plan 支持（可选）**
-   - [ ] 支持读取预先 Plan（来自编排 Agent）
-   - [ ] 实现 Plan 偏离检测和日志记录
+4. **Plan 支持（✅ 已完成）**
+   - [x] 支持读取预先 Plan（来自编排 Agent 的 `PlanSpec`）
+   - [x] 支持按子任务顺序驱动执行（按 `PlanSpec.steps` 逐步下发子任务）
+   - [x] 实现 Plan 偏离检测和日志记录（按 `PlanSpec` 结构化记录，支持 execution_mode 和 deviation_log_required）
+   - [x] 实现 success_criteria 结构化校验（支持 status, required_fields, field_checks）
+   - [x] 实现 retry_policy 重试机制（支持 fixed/linear/exponential 退避策略）
+   - [x] 实现 timeout_seconds 超时控制
+   - [x] 实现并行执行无依赖的子任务
+   - [x] 实现子任务目标达成评估（LLM 评估）
+   - [x] 实现执行指标收集（执行时间、重试次数等）
+   - [x] 实现命令处理功能（/new, /help, /audit, /template, /memory）
+   - [ ] （后续）集成 PlanExecutor / SchemaValidator 等更严格执行器
 
 5. **候选 Workflow 抽取**
-   - [ ] 实现执行轨迹抽取（成功时）
-   - [ ] 生成候选 Workflow 骨架
+   - [x] 实现执行轨迹持久化（成功/失败均有 ExecutionTrace）
+   - [x] 在审计通过后，由编排 Agent 模式 B 基于 ExecutionTrace 生成候选 Workflow（已在 `ExecutionAgent.process_task` 中接入）
+   - [ ] 针对「仅执行 Agent 视角」的轻量 Workflow 骨架抽取（可选增强）
 
 **验收标准**:
 - 执行 Agent 可以在瘦上下文约束下运行
@@ -959,35 +1102,46 @@ class LLMProvider(ABC):
 
 ### 6.3 Phase 3: 编排 Agent 实现（2-3 周）
 
-**目标**: 实现编排 Agent 三种模式
+**目标**: 实现编排 Agent 四种模式（A/B/C/D）
 
 **任务清单**:
 
-1. **模式 A: 任务拆解 Plan 设计**
-   - [ ] 实现任务拆解逻辑
-   - [ ] 实现 PlanSpec 生成
-   - [ ] 集成能力清单和历史案例
+1. **模式 A: 任务拆解 Plan 设计（✅ 已重构）**
+   - [x] 实现任务拆解逻辑（`ModeATaskPlan.generate_plan`）
+   - [x] 实现 PlanSpec 生成（✅ 已对齐新版 Schema：包含 `subtask_goal`、结构化 `success_criteria`、`retry_policy`、`execution_mode` 等）
+   - [x] 集成能力清单（来自 CapabilityRegistry）
+   - [x] 移除兼容旧格式代码，严格按新格式生成
+   - [ ] 集成失败经验库摘要作为负面样本输入（Mode D 输出接入）
 
-2. **模式 B: 模板抽取**
-   - [ ] 实现 ExecutionTrace 读取
-   - [ ] 实现步骤过滤和抽象
-   - [ ] 实现 CandidateWorkflowSpec 生成
-   - [ ] 实现人工审核接口
+2. **模式 B: 模板抽取（✅ 已实现）**
+   - [x] 实现 ExecutionTrace 读取（通过 LogService/Database）
+   - [x] 实现步骤过滤和抽象（`mode_b_template_extract.py`，结合审计报告过滤错误/探索性步骤）
+   - [x] 实现 CandidateWorkflowSpec 生成
+   - [x] 已集成到 `OrchestrationAgent.extract_workflow`
+   - [ ] 实现人工审核接口（待审批区 / 明确注册指令）
 
-3. **模式 C: 测试用例生成**
-   - [ ] 实现测试用例设计逻辑
-   - [ ] 实现 TestCaseSpec 生成
-   - [ ] 集成 TestCaseStore
+3. **模式 C: 测试用例生成（✅ 已实现）**
+   - [x] 实现测试用例设计逻辑（基础版，`mode_c_test_generation.py`）
+   - [x] 实现 TestCaseSpec 生成
+   - [x] 集成 TestCaseStore（使用 Database 持久化）
+   - [x] 已集成到 `OrchestrationAgent.generate_test_cases`
 
-4. **编排 Agent 主入口**
-   - [ ] 实现模式路由
-   - [ ] 实现与执行 Agent 和审计 Agent 的交互
+4. **编排 Agent 主入口（✅ 部分完成）**
+   - [x] 实现模式路由（`OrchestrationAgent` 中统一封装 A/B/C）
+   - [x] 实现与执行 Agent / 审计 Agent 的交互（在 `ExecutionAgent.process_task` 中，审计后触发 Mode B + 测试）
+   - [x] 增加模式 D 入口：从审计失败/高风险结果生成 FailureExperience（✅ 已完成）
+     - [x] 创建 `mode_d_failure_experience.py` 实现
+     - [x] 创建 `schemas/failure_experience.py` Schema
+     - [x] 在 `OrchestrationAgent` 中集成 Mode D
+     - [x] 在 `ExecutionAgent` 中触发 Mode D（审计失败/高风险时）
+     - [x] 在 Database 中添加失败经验持久化支持
 
 **验收标准**:
-- 模式 A 可以生成有效的 PlanSpec
-- 模式 B 可以从执行日志抽取 Workflow 骨架
-- 模式 C 可以生成测试用例
-- 三种模式可以独立运行
+- ✅ 模式 A 可以生成有效的 PlanSpec
+- ✅ 模式 B 可以从执行日志抽取 Workflow 骨架
+- ✅ 模式 C 可以生成测试用例
+- ✅ 模式 D 可以从失败执行生成 FailureExperience
+- ✅ 四种模式可以独立运行
 
 ---
 
@@ -998,23 +1152,24 @@ class LLMProvider(ABC):
 **任务清单**:
 
 1. **审计 Case 构建**
-   - [ ] 实现 ExecutionTrace 读取
-   - [ ] 实现用户视图读取
-   - [ ] 实现审计 Case 组装
+   - [x] 实现 ExecutionTrace 读取（通过 LogService/Database）
+   - [x] 实现用户视图读取
+   - [x] 实现审计 Case 组装（`AuditCaseBuilder`）
 
 2. **监督 LLM 评估**
-   - [ ] 实现监督 Prompt 设计
-   - [ ] 实现 LLM 评估逻辑
-   - [ ] 实现结果解析
+   - [x] 实现监督 Prompt 设计（`LLMJudge` system prompt，支持 `intermediate_error` 等）
+   - [x] 实现 LLM 评估逻辑
+   - [x] 实现结果解析（解析为 judgment dict）
 
 3. **审计报告生成**
-   - [ ] 实现 AuditReport 生成
-   - [ ] 实现问题证据提取
-   - [ ] 审计完成后将 AuditReport 持久化到 Database（见 7.3 节）
+   - [x] 实现 AuditReport 生成（`ReportGenerator`）
+   - [x] 实现问题证据提取
+   - [x] 审计完成后将 AuditReport 持久化到 Database（见 7.3 节）
 
 4. **审计结果处理**
-   - [ ] 实现与编排 Agent 的交互（模板升级）
-   - [ ] 实现告警和降权机制
+   - [x] 实现与编排 Agent 的交互（模板升级：pass + eligible 时触发 Mode B 抽 Workflow）
+   - [x] 实现与编排 Agent 的交互（失败/高风险时触发 Mode D 构建 FailureExperience）
+   - [ ] 实现告警和降权机制（如模型降权、能力屏蔽等）
 
 **验收标准**:
 - 可以读取执行日志和用户视图
@@ -1031,10 +1186,11 @@ class LLMProvider(ABC):
 **任务清单**:
 
 1. **端到端测试**
-   - [ ] 测试执行 Agent 完整流程
-   - [ ] 测试编排 Agent 三种模式
+   - [ ] 测试执行 Agent 完整流程（含审计与 Workflow 抽取）
+   - [ ] 测试编排 Agent A/B/C/D 模式
    - [ ] 测试日志监督 Agent 审计流程
-   - [ ] 测试 Agent 间交互
+   - [ ] 测试 Agent 间交互（Planner ↔ Execution ↔ Auditor）
+   - [x] 测试 Tester Agent（测试用例执行和结果汇总）
 
 2. **性能优化**
    - [ ] 优化上下文管理（滑动窗口效率）
@@ -1042,9 +1198,9 @@ class LLMProvider(ABC):
    - [ ] 优化能力匹配速度
 
 3. **文档完善**
-   - [ ] 完善 API 文档
-   - [ ] 完善使用示例
-   - [ ] 完善架构文档
+   - [ ] 完善 API 文档（对齐最新 `PlanSpec` / `AuditReport` / `FailureExperience` 等）
+   - [ ] 完善使用示例（展示 Plan → 执行 → 审计 → Workflow/经验 的完整链路）
+   - [ ] 完善架构文档（与当前 SPEC 同步演进）
 
 **验收标准**:
 - 所有端到端测试通过
@@ -1559,4 +1715,20 @@ tedbot/
 
 - 2026-02-21: 初始版本，完成详细规范设计
 - 2026-02-21: 补充 Session 上下文管理、两层上下文构建、Memory 智能提取、能力渐进式加载、Workspace 结构、命令系统、渠道系统等规范
+- 2026-02-22: **重大重构完成** - Plan as Specification 范式实现
+  - ✅ PlanSpec Schema 升级（subtask_goal, success_criteria, retry_policy, execution_mode 等）
+  - ✅ Mode A 规划逻辑重构（严格按新格式，移除兼容代码）
+  - ✅ ExecutionAgent 重构为 Plan 驱动执行（按 PlanSpec.steps 逐个执行子任务）
+  - ✅ 实现 success_criteria 结构化校验
+  - ✅ 实现 retry_policy 重试机制（支持 fixed/linear/exponential）
+  - ✅ 实现 timeout_seconds 超时控制
+  - ✅ 实现并行执行无依赖的子任务
+  - ✅ 实现子任务目标达成评估（LLM 评估）
+  - ✅ 实现执行指标收集（执行时间、重试次数等）
+  - ✅ 实现命令处理功能（/new, /help, /audit, /template, /memory）
+  - ✅ 完善 PlanSpec 数据库保存逻辑（包含 execution_mode 等字段）
+  - ✅ Mode B 工作流抽取（已实现并集成到 OrchestrationAgent）
+  - ✅ Mode C 测试用例生成（已实现并集成到 OrchestrationAgent）
+  - ✅ Mode D 失败经验构建（已完成：创建了 mode_d_failure_experience.py 和 failure_experience.py schema，集成到 OrchestrationAgent 和 ExecutionAgent）
+  - ✅ Tester Agent 测试执行（已完成：实现了测试用例执行、结果比较和汇总功能）
 - 2026-02-21: 新增 7.3 SQLite 持久化存储规范，定义 Database 类、表结构、持久化范围及组件集成方式

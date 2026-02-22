@@ -7,6 +7,7 @@ from typing import Literal
 from openbot.agent.planner.mode_a_task_plan import ModeATaskPlan
 from openbot.agent.planner.mode_b_template_extract import ModeBTemplateExtract
 from openbot.agent.planner.mode_c_test_generation import ModeCTestGeneration
+from openbot.agent.planner.mode_d_failure_experience import ModeDFailureExperience
 from openbot.infra.capability_registry import CapabilityRegistry
 from openbot.infra.log_service import LogService
 from openbot.infra.template_registry import TemplateRegistry
@@ -14,6 +15,7 @@ from openbot.infra.test_case_store import TestCaseStore
 from openbot.providers.base import LLMProvider
 from openbot.schemas.audit_report import AuditReport
 from openbot.schemas.execution_trace import ExecutionTraceModel as ExecutionTrace
+from openbot.schemas.failure_experience import FailureExperience
 from openbot.schemas.plan_spec import PlanSpec
 from openbot.schemas.test_case_spec import TestCaseSpec
 from openbot.schemas.workflow_spec import CandidateWorkflowSpec
@@ -22,10 +24,11 @@ from openbot.schemas.workflow_spec import CandidateWorkflowSpec
 class OrchestrationAgent:
     """编排 Agent 主入口。
     
-    支持三种模式：
+    支持四种模式：
     - Mode A: 任务拆解 Plan 设计
     - Mode B: 从成功执行日志抽象 Workflow
     - Mode C: 为能力/Workflow 生成测试用例
+    - Mode D: 从失败执行轨迹构建失败经验
     """
 
     def __init__(
@@ -47,7 +50,7 @@ class OrchestrationAgent:
         self._model = model or provider.get_default_model()
         self._temperature = temperature
         
-        # 初始化三种模式
+        # 初始化四种模式
         self._mode_a = ModeATaskPlan(
             provider=provider,
             capability_registry=capability_registry,
@@ -67,22 +70,31 @@ class OrchestrationAgent:
             model=self._model,
             temperature=self._temperature,
         )
+        self._mode_d = ModeDFailureExperience(
+            provider=provider,
+            model=self._model,
+            temperature=self._temperature,
+        )
 
     async def plan_task(
         self,
         task: str,
         context: dict | None = None,
+        session=None,  # Session 对象
+        context_builder=None,  # ContextBuilder 对象
     ) -> PlanSpec:
         """模式 A: 任务拆解 Plan 设计。
         
         Args:
             task: 任务描述
             context: 可选上下文信息
+            session: 可选的 Session 对象（用于获取 Session 上下文）
+            context_builder: 可选的 ContextBuilder 对象（用于构建完整上下文）
         
         Returns:
             PlanSpec 对象
         """
-        return await self._mode_a.generate_plan(task, context)
+        return await self._mode_a.generate_plan(task, context, session=session, context_builder=context_builder)
 
     async def extract_workflow(
         self,
@@ -123,3 +135,26 @@ class OrchestrationAgent:
             test_types = ["normal", "boundary", "error", "extreme"]
         
         return await self._mode_c.generate_test_cases(capability_name, test_types)
+
+    async def build_failure_experience(
+        self,
+        trace_id: str,
+        audit_report: AuditReport,
+        plan_id: str | None = None,
+    ) -> FailureExperience:
+        """模式 D: 从失败执行轨迹构建失败经验。
+        
+        Args:
+            trace_id: 执行轨迹 ID
+            audit_report: 审计报告
+            plan_id: 可选的 Plan ID
+        
+        Returns:
+            FailureExperience 对象
+        """
+        # 读取执行轨迹
+        trace = self._log_svc.get_trace(trace_id)
+        if not trace:
+            raise ValueError(f"Execution trace not found: {trace_id}")
+        
+        return await self._mode_d.build_failure_experience(trace, audit_report, plan_id)

@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from loguru import logger
+
 from openbot.schemas.audit_report import AuditIssue, AuditReport, Evidence
 from openbot.schemas.execution_trace import ExecutionTraceModel as ExecutionTrace
 
@@ -47,12 +49,45 @@ class ReportGenerator:
             
             evidence = None
             if evidence_data:
+                # 规范化 step_id：如果是字符串，尝试转换；如果是 'all' 等特殊值，设为 None
+                step_id_raw = evidence_data.get("step_id")
+                step_id = None
+                if step_id_raw is not None:
+                    if isinstance(step_id_raw, int):
+                        step_id = step_id_raw
+                    elif isinstance(step_id_raw, str):
+                        # 尝试转换为整数
+                        if step_id_raw.lower() in ["all", "none", "null", ""]:
+                            step_id = None
+                        else:
+                            try:
+                                step_id = int(step_id_raw)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Invalid step_id format: {step_id_raw}, setting to None")
+                                step_id = None
+                
+                # 规范化 corrected_by_step
+                corrected_by_raw = evidence_data.get("corrected_by_step")
+                corrected_by = None
+                if corrected_by_raw is not None:
+                    if isinstance(corrected_by_raw, int):
+                        corrected_by = corrected_by_raw
+                    elif isinstance(corrected_by_raw, str):
+                        if corrected_by_raw.lower() in ["all", "none", "null", ""]:
+                            corrected_by = None
+                        else:
+                            try:
+                                corrected_by = int(corrected_by_raw)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Invalid corrected_by_step format: {corrected_by_raw}, setting to None")
+                                corrected_by = None
+                
                 evidence = Evidence(
-                    step_id=evidence_data.get("step_id"),
+                    step_id=step_id,
                     log_key=evidence_data.get("log_key"),
                     user_statement=evidence_data.get("user_statement"),
                     actual_result=evidence_data.get("actual_result"),
-                    corrected_by_step=evidence_data.get("corrected_by_step"),
+                    corrected_by_step=corrected_by,
                 )
             
             issue = AuditIssue(

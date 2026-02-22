@@ -19,6 +19,7 @@ _DB_WRITE_RETRY_DELAY = 0.5  # 秒，指数退避
 from openbot.config import load_config
 from openbot.schemas.audit_report import AuditIssue, AuditReport
 from openbot.schemas.execution_trace import ExecutionStepModel, ExecutionTraceModel
+from openbot.schemas.failure_experience import FailureExperience
 from openbot.schemas.plan_spec import PlanSpec, PlanStep
 from openbot.schemas.test_case_spec import TestCaseSpec, ToleranceSpec
 from openbot.schemas.workflow_spec import WorkflowSpec, WorkflowStepSpec
@@ -144,6 +145,30 @@ class Database:
                 )
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_plans_created_at ON plans(created_at)")
+            
+            # 6. 失败经验表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS failure_experiences (
+                    failure_id TEXT PRIMARY KEY,
+                    task TEXT NOT NULL,
+                    plan_id TEXT,
+                    trace_id TEXT NOT NULL,
+                    failure_stage TEXT NOT NULL,
+                    failure_step_id INTEGER,
+                    failure_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    root_cause_hypothesis TEXT NOT NULL,
+                    context_snippets_json TEXT NOT NULL,
+                    lessons_learned TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (trace_id) REFERENCES execution_traces(trace_id)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_failures_trace_id ON failure_experiences(trace_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_failures_task ON failure_experiences(task)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_failures_type ON failure_experiences(failure_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_failures_stage ON failure_experiences(failure_stage)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_failures_created_at ON failure_experiences(created_at)")
             
             conn.commit()
         finally:
@@ -501,26 +526,45 @@ class Database:
     # ========== PlanSpec ==========
 
     def save_plan(self, plan: PlanSpec) -> None:
-        """保存计划"""
+        """保存计划（包含 execution_mode 等完整字段）"""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
+            # 检查表结构是否需要更新（添加 execution_mode 等字段）
+            cursor.execute("PRAGMA table_info(plans)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            # 如果表结构不包含新字段，先更新表结构
+            if "execution_mode" not in columns:
+                try:
+                    cursor.execute("ALTER TABLE plans ADD COLUMN execution_mode TEXT")
+                    cursor.execute("ALTER TABLE plans ADD COLUMN max_deviations INTEGER")
+                    cursor.execute("ALTER TABLE plans ADD COLUMN deviation_log_required INTEGER")
+                    conn.commit()
+                except Exception:
+                    # 如果字段已存在或其他错误，忽略
+                    pass
+            
+            # 保存完整 PlanSpec（包含所有字段）
             cursor.execute("""
                 INSERT OR REPLACE INTO plans
-                (plan_id, task, steps_json, created_at)
-                VALUES (?, ?, ?, ?)
+                (plan_id, task, steps_json, created_at, execution_mode, max_deviations, deviation_log_required)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 plan.plan_id,
                 plan.task,
                 json.dumps([step.model_dump() for step in plan.steps], ensure_ascii=False),
                 plan.created_at.isoformat(),
+                plan.execution_mode,
+                plan.max_deviations,
+                1 if plan.deviation_log_required else 0,
             ))
             conn.commit()
         finally:
             conn.close()
 
     def get_plan(self, plan_id: str) -> PlanSpec | None:
-        """获取计划"""
+        """获取计划（包含 execution_mode 等完整字段）"""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
@@ -532,11 +576,144 @@ class Database:
             steps_data = json.loads(row["steps_json"])
             steps = [PlanStep(**s) for s in steps_data]
             
+            # 兼容旧数据（可能没有 execution_mode 字段）
+            execution_mode = row.get("execution_mode", "strict")
+            max_deviations = row.get("max_deviations", 0)
+            deviation_log_required = bool(row.get("deviation_log_required", 1))
+            
             return PlanSpec(
                 plan_id=row["plan_id"],
                 task=row["task"],
                 created_at=datetime.fromisoformat(row["created_at"]),
                 steps=steps,
+                execution_mode=execution_mode,
+                max_deviations=max_deviations,
+                deviation_log_required=deviation_log_required,
             )
+        finally:
+            conn.close()
+
+    # ========== FailureExperience ==========
+
+    def save_failure_experience(self, failure: FailureExperience) -> None:
+        """保存失败经验（带重试）"""
+        def _do_write():
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO failure_experiences
+                    (failure_id, task, plan_id, trace_id, failure_stage, failure_step_id,
+                     failure_type, summary, root_cause_hypothesis, context_snippets_json,
+                     lessons_learned, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    failure.failure_id,
+                    failure.task,
+                    failure.plan_id,
+                    failure.trace_id,
+                    failure.failure_stage,
+                    failure.failure_step_id,
+                    failure.failure_type,
+                    failure.summary,
+                    failure.root_cause_hypothesis,
+                    json.dumps(failure.context_snippets, ensure_ascii=False),
+                    failure.lessons_learned,
+                    failure.created_at.isoformat(),
+                ))
+                conn.commit()
+            finally:
+                conn.close()
+
+        self._write_with_retry(_do_write)
+
+    def get_failure_experience(self, failure_id: str) -> FailureExperience | None:
+        """获取失败经验"""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM failure_experiences WHERE failure_id = ?", (failure_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            context_snippets = json.loads(row["context_snippets_json"])
+            
+            return FailureExperience(
+                failure_id=row["failure_id"],
+                task=row["task"],
+                plan_id=row["plan_id"],
+                trace_id=row["trace_id"],
+                failure_stage=row["failure_stage"],
+                failure_step_id=row["failure_step_id"],
+                failure_type=row["failure_type"],
+                summary=row["summary"],
+                root_cause_hypothesis=row["root_cause_hypothesis"],
+                context_snippets=context_snippets,
+                lessons_learned=row["lessons_learned"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+        finally:
+            conn.close()
+
+    def list_failure_experiences(
+        self,
+        limit: int = 100,
+        failure_type: str | None = None,
+        failure_stage: str | None = None,
+        task_pattern: str | None = None,
+    ) -> list[FailureExperience]:
+        """列出失败经验
+        
+        Args:
+            limit: 返回数量限制
+            failure_type: 过滤失败类型
+            failure_stage: 过滤失败阶段
+            task_pattern: 任务描述模式（LIKE 查询）
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            conditions = []
+            params = []
+            
+            if failure_type:
+                conditions.append("failure_type = ?")
+                params.append(failure_type)
+            if failure_stage:
+                conditions.append("failure_stage = ?")
+                params.append(failure_stage)
+            if task_pattern:
+                conditions.append("task LIKE ?")
+                params.append(f"%{task_pattern}%")
+            
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            query = f"SELECT * FROM failure_experiences WHERE {where_clause} ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            
+            cursor.execute(query, params)
+            
+            failures = []
+            for row in cursor.fetchall():
+                context_snippets = json.loads(row["context_snippets_json"])
+                
+                failures.append(
+                    FailureExperience(
+                        failure_id=row["failure_id"],
+                        task=row["task"],
+                        plan_id=row["plan_id"],
+                        trace_id=row["trace_id"],
+                        failure_stage=row["failure_stage"],
+                        failure_step_id=row["failure_step_id"],
+                        failure_type=row["failure_type"],
+                        summary=row["summary"],
+                        root_cause_hypothesis=row["root_cause_hypothesis"],
+                        context_snippets=context_snippets,
+                        lessons_learned=row["lessons_learned"],
+                        created_at=datetime.fromisoformat(row["created_at"]),
+                    )
+                )
+            
+            return failures
         finally:
             conn.close()
