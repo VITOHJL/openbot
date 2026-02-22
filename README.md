@@ -25,23 +25,84 @@
 
 ## 项目简介
 
-一个基于 **单 Agent 规范** 的 AI 助手，具备：
+一个基于 **多 Agent 协作架构** 的 AI 助手系统，采用 PlanSpec 驱动的执行模式。
 
-- 单执行 Agent：所有工具调用都经由一个核心循环
-- 三层能力栈：Atomic / Skill / Workflow
-- 瘦执行上下文 + 完整 ExecutionTrace 日志
-- 编排 Agent：任务拆解、模板抽取、测试用例生成
-- 日志监督 Agent：行为审计、防止"为达目的而撒谎"
-- QQ + CLI 渠道：最小但可用的外接通讯能力
+### 核心架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    多 Agent 协作架构                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │  执行Agent   │    │  编排Agent   │    │  审计Agent   │  │
+│  │ (Execution)  │    │ (Planner)    │    │  (Auditor)   │  │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
+│         │                   │                    │          │
+│         └───────────────────┼────────────────────┘          │
+│                             │                               │
+│  ┌──────────────┐           │                               │
+│  │  测试Agent   │           │                               │
+│  │  (Tester)    │           │                               │
+│  └──────────────┘           │                               │
+│                             │                               │
+│  ┌──────────────────────────┼──────────────────────────┐   │
+│  │        能力栈 (CapabilityRegistry)                   │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐          │   │
+│  │  │ Workflow │  │ Skill/   │  │ Atomic   │          │   │
+│  │  │   层     │  │  MCP层   │  │   层     │          │   │
+│  │  └──────────┘  └──────────┘  └──────────┘          │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Agent 职责
+
+1. **编排 Agent (OrchestrationAgent/Planner)**
+   - **Mode A**: 任务拆解 Plan 设计 - 将用户任务拆解为 PlanSpec
+   - **Mode B**: 模板抽取 - 从成功执行轨迹抽象 Workflow
+   - **Mode C**: 测试用例生成 - 为能力/Workflow 生成测试用例
+   - **Mode D**: 失败经验构建 - 从失败执行轨迹构建失败经验
+   - 包含 Session 上下文，用于理解任务意图
+
+2. **执行 Agent (ExecutionAgent)**
+   - 唯一在线执行者，所有工具调用都经由它
+   - 按 PlanSpec 执行子任务，每个子任务内部使用 React 模式
+   - 不包含 Session 上下文，只按 Plan 执行
+   - 支持 success_criteria 验证和 LLM 目标评估
+
+3. **审计 Agent (AuditorAgent)**
+   - 监督执行轨迹，判定是否存在撒谎、越权等问题
+   - 生成 AuditReport，包含 verdict、risk_level、issues
+   - 支持迭代修正识别（中间错误但已修正的情况）
+
+4. **测试 Agent (TesterAgent)**
+   - 执行测试用例，验证能力/Workflow 的正确性
+   - 支持 TestCaseSpec 的多种测试类型
+
+### 核心特性
+
+- **PlanSpec 驱动执行**：通过 JSON Schema 定义执行计划，确保结构化执行
+- **三层能力栈**：Atomic / Skill / Workflow，支持渐进式能力注册
+- **瘦执行上下文 + 完整 ExecutionTrace 日志**：上下文精简，日志完整
+- **两层上下文管理**：
+  - Session 上下文：用于理解任务（Planner 使用）
+  - 执行上下文：用于执行任务（Execution Agent 使用）
+- **可审计可追溯**：所有决策和调用都有日志，支持事后审计
 
 详细设计规范见仓库根目录的 `SPEC.md`。该项目的目标是在实践中验证并迭代这套规范。
 
 ## 当前状态
 
-### ✅ 已完成（Phase 1 部分）
+### ✅ 已完成
 
 1. **数据结构与 Schema 定义**
-   - ✅ PlanSpec、ExecutionTrace、WorkflowSpec、AuditReport、TestCaseSpec
+   - ✅ PlanSpec（执行计划规范）
+   - ✅ ExecutionTrace（执行轨迹）
+   - ✅ WorkflowSpec（工作流规范）
+   - ✅ AuditReport（审计报告）
+   - ✅ TestCaseSpec（测试用例规范）
+   - ✅ FailureExperience（失败经验）
 
 2. **基础设施实现**
    - ✅ ContextManager（瘦执行上下文管理）
@@ -51,35 +112,55 @@
    - ✅ TestCaseStore（测试用例存储）
    - ✅ SessionManager（会话管理，含 Session 上下文接口）
    - ✅ MemoryStore（长期记忆系统）
+   - ✅ Database（SQLite 持久化）
 
-3. **核心组件**
-   - ✅ ExecutionAgent（执行 Agent 核心循环）
+3. **Agent 实现**
+   - ✅ **ExecutionAgent**：执行 Agent 核心循环
+     - PlanSpec 驱动的子任务执行
+     - React 模式内部循环
+     - success_criteria 验证
+     - LLM 目标评估
+   - ✅ **OrchestrationAgent/Planner**：编排 Agent
+     - ✅ Mode A: 任务拆解 Plan 设计
+     - ✅ Mode B: 模板抽取
+     - ✅ Mode C: 测试用例生成
+     - ✅ Mode D: 失败经验构建
+   - ✅ **AuditorAgent**：审计 Agent
+     - 执行轨迹审计
+     - 撒谎/越权检测
+     - 迭代修正识别
+   - ✅ **TesterAgent**：测试 Agent
+     - 测试用例执行
+     - 结果验证
+
+4. **上下文管理**
    - ✅ ContextBuilder（两层上下文构建）
-   - ✅ LLM Provider 抽象（LiteLLMProvider）
-   - ✅ MessageBus（消息总线）
+     - Session 上下文（Planner 使用，用于理解任务）
+     - 执行上下文（Execution Agent 使用，用于执行任务）
+   - ✅ 上下文隔离：Execution Agent 不包含 Session 历史
 
-4. **CLI 命令**
+5. **工具与能力**
+   - ✅ Atomic 层工具（filesystem, shell, echo 等）
+   - ✅ 工具注册与执行机制
+   - ✅ 能力调用验证
+
+6. **CLI 命令**
    - ✅ `openbot agent -m "message"` - 单次对话
    - ✅ `openbot agent` - 交互式模式
    - ✅ `openbot config` - 查看/初始化配置
 
-5. **配置系统**
+7. **配置系统**
    - ✅ 配置文件管理（`~/.openbot/config.json`）
    - ✅ 多 Provider 支持（OpenRouter, Anthropic, OpenAI 等）
    - ✅ 环境变量覆盖
    - ✅ Provider Registry 自动匹配
 
-### 🚧 进行中
-
-- 工具注册与执行（Atomic 层）
-- 能力实际调用逻辑完善
-
 ### 📋 待完成
 
-- 编排 Agent 三种模式
-- 日志监督 Agent
+- Skill/Workflow 层能力扩展
 - QQ 渠道集成
-- 更多 Atomic/Skill/Workflow 能力
+- 更多测试用例类型支持
+- 性能优化（减少 token 消耗）
 
 ## 快速开始
 
@@ -178,23 +259,46 @@ openbot agent
 ```
 openbot/
 ├── openbot/
-│   ├── agent/          # Agent 核心
-│   │   ├── loop.py     # ExecutionAgent
-│   │   ├── context.py  # ContextBuilder
-│   │   ├── memory.py   # MemoryStore
-│   │   └── tools/      # Atomic 工具
-│   ├── infra/          # 基础设施
-│   │   ├── context_manager.py
-│   │   ├── log_service.py
-│   │   ├── capability_registry.py
-│   │   ├── template_registry.py
-│   │   └── test_case_store.py
-│   ├── schemas/        # 数据结构 Schema
-│   ├── providers/      # LLM Provider
-│   ├── bus/           # 消息总线
-│   ├── session/       # 会话管理
-│   └── cli/           # CLI 命令
-└── SPEC.md            # 详细设计规范
+│   ├── agent/              # Agent 核心
+│   │   ├── loop.py         # ExecutionAgent（执行 Agent）
+│   │   ├── context.py      # ContextBuilder（上下文构建）
+│   │   ├── memory.py       # MemoryStore（长期记忆）
+│   │   ├── tester.py      # TesterAgent（测试 Agent）
+│   │   ├── planner/        # OrchestrationAgent（编排 Agent）
+│   │   │   ├── planner.py  # 主入口
+│   │   │   ├── mode_a_task_plan.py          # Mode A: 任务拆解
+│   │   │   ├── mode_b_template_extract.py   # Mode B: 模板抽取
+│   │   │   ├── mode_c_test_generation.py    # Mode C: 测试生成
+│   │   │   └── mode_d_failure_experience.py # Mode D: 失败经验
+│   │   ├── auditor/        # AuditorAgent（审计 Agent）
+│   │   │   ├── auditor.py  # 主入口
+│   │   │   ├── case_builder.py    # 审计 Case 构建
+│   │   │   ├── llm_judge.py       # LLM 评估
+│   │   │   └── report_generator.py # 报告生成
+│   │   └── tools/          # Atomic 工具
+│   │       ├── base.py     # 工具基类
+│   │       ├── filesystem.py
+│   │       ├── shell.py
+│   │       └── registry.py
+│   ├── infra/              # 基础设施
+│   │   ├── context_manager.py    # 执行上下文管理
+│   │   ├── log_service.py        # 执行轨迹记录
+│   │   ├── capability_registry.py # 能力注册
+│   │   ├── template_registry.py  # 模板库
+│   │   ├── test_case_store.py    # 测试用例存储
+│   │   └── database.py           # 数据库持久化
+│   ├── schemas/            # 数据结构 Schema
+│   │   ├── plan_spec.py           # PlanSpec
+│   │   ├── execution_trace.py     # ExecutionTrace
+│   │   ├── workflow_spec.py       # WorkflowSpec
+│   │   ├── audit_report.py        # AuditReport
+│   │   ├── test_case_spec.py      # TestCaseSpec
+│   │   └── failure_experience.py  # FailureExperience
+│   ├── providers/          # LLM Provider
+│   ├── bus/               # 消息总线
+│   ├── session/           # 会话管理
+│   └── cli/               # CLI 命令
+└── SPEC.md                # 详细设计规范
 ```
 
 ## 开发
